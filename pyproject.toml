@@ -1,12 +1,15 @@
 [project]
 name = "hiring-feasibility-engine"
-version = "0.1.0"
-description = "Hiring Feasibility Engine - Capacity Planning Dashboard"
+version = "1.0.0"
+description = "Hiring Feasibility Engine - Capacity Planning Dashboard using Monte Carlo simulation"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.9"
 dependencies = [
-"streamlit>=1.30.0",
-"numpy>=1.24.0",
-"scipy>=1.11.0",
-"uvicorn>=0.25.0"
+    "streamlit>=1.30.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "pandas>=2.0.0",
 ]
+
+[project.scripts]
+hiring-engine = "app:main"
