@@ -22,7 +22,7 @@ import pandas as pd
 # =============================================================================
 
 TODAY = date.today()
-SIMULATION_RUNS = 10000
+SIMULATION_RUNS = 5000
 SIMULATION_MONTHS = 6
 
 COMPLEXITY_SHAPE_K = {
@@ -97,12 +97,10 @@ class SimulationResult:
 # =============================================================================
 
 @st.cache_data
-def load_data() -> Tuple[Dict[str, Recruiter], List[Role]]:
-    with open('recruiters.json', 'r') as f:
-        recruiters_data = json.load(f)
-    
-    with open('hiring_plan.json', 'r') as f:
-        roles_data = json.load(f)
+def parse_uploaded_data(recruiters_json: str, hiring_plan_json: str) -> Tuple[Dict[str, Recruiter], List[Role]]:
+    """Parse uploaded JSON data into Recruiter and Role objects."""
+    recruiters_data = json.loads(recruiters_json)
+    roles_data = json.loads(hiring_plan_json)
     
     recruiters = {
         r['id']: Recruiter(
@@ -127,57 +125,63 @@ def load_data() -> Tuple[Dict[str, Recruiter], List[Role]]:
     
     return recruiters, roles
 
+def validate_data(recruiters: Dict, roles: List) -> Tuple[bool, str]:
+    """Validate uploaded data for consistency."""
+    errors = []
+    
+    # Check if all assigned recruiters exist
+    for role in roles:
+        if role.assigned_recruiter_id not in recruiters:
+            errors.append(f"Role {role.id} assigned to unknown recruiter {role.assigned_recruiter_id}")
+    
+    # Check for required fields
+    if not recruiters:
+        errors.append("No recruiters found in uploaded file")
+    if not roles:
+        errors.append("No roles found in uploaded file")
+    
+    if errors:
+        return False, "\n".join(errors)
+    return True, f"✅ Loaded {len(recruiters)} recruiters and {len(roles)} roles"
+
 # =============================================================================
 # MONTE CARLO SIMULATION ENGINE
 # =============================================================================
 
-def generate_poisson_hiring_events(recruiter: Recruiter, days: int, n_simulations: int) -> np.ndarray:
-    expected_hires = recruiter.avg_monthly_capacity * (days / 30.44)
-    max_events = int(expected_hires * 3)
-    
-    rng = np.random.default_rng()
-    inter_arrivals = rng.exponential(
-        scale=recruiter.mean_days_between_hires,
-        size=(n_simulations, max_events)
-    )
-    
-    cumulative_times = np.cumsum(inter_arrivals, axis=1)
-    return cumulative_times
-
 def simulate_role_completion(role: Role, queue_position: int, 
-                            hiring_event_times: np.ndarray) -> np.ndarray:
-    n_simulations = hiring_event_times.shape[0]
+                            recruiter: Recruiter, n_simulations: int,
+                            seed: int = None) -> np.ndarray:
+    """Simulate completion times for a role."""
+    rng = np.random.default_rng(seed)
     
-    if queue_position < hiring_event_times.shape[1]:
-        slot_times = hiring_event_times[:, queue_position]
+    # Queue wait time based on position and recruiter capacity
+    monthly_capacity = recruiter.avg_monthly_capacity
+    expected_wait_months = queue_position / monthly_capacity
+    expected_wait_days = expected_wait_months * 30.44
+    
+    if expected_wait_days > 1:
+        wait_shape = 2.0
+        wait_scale = expected_wait_days / wait_shape
+        queue_wait = rng.gamma(shape=wait_shape, scale=wait_scale, size=n_simulations)
     else:
-        last_time = hiring_event_times[:, -1]
-        extra_slots = queue_position - hiring_event_times.shape[1] + 1
-        slot_times = last_time + extra_slots * (30.44 / 3.0)
+        queue_wait = np.zeros(n_simulations)
     
-    rng = np.random.default_rng()
-    completion_variability = rng.gamma(
-        shape=role.gamma_shape,
-        scale=role.gamma_scale,
-        size=n_simulations
-    )
+    # Process time with variability based on complexity
+    process_shape = role.gamma_shape
+    process_scale = role.avg_days_to_hire / process_shape
+    process_time = rng.gamma(shape=process_shape, scale=process_scale, size=n_simulations)
     
-    queue_delay_factor = 0.3
-    
-    total_completion_days = (
-        slot_times * queue_delay_factor +
-        completion_variability
-    )
-    
-    return total_completion_days
+    return queue_wait + process_time
+
 
 @st.cache_data
 def run_monte_carlo_simulation(_recruiters: dict, _roles: list, 
                                n_simulations: int = SIMULATION_RUNS) -> Dict:
+    """Run Monte Carlo simulation for the entire hiring plan."""
     recruiters = _recruiters
     roles = _roles
-    simulation_days = SIMULATION_MONTHS * 30
     
+    # Group roles by recruiter and sort by urgency
     recruiter_roles: Dict[str, List[Role]] = {}
     for role in roles:
         rec_id = role.assigned_recruiter_id
@@ -188,22 +192,26 @@ def run_monte_carlo_simulation(_recruiters: dict, _roles: list,
     for rec_id in recruiter_roles:
         recruiter_roles[rec_id].sort(key=lambda r: r.urgency_score)
     
-    recruiter_hiring_events = {}
-    for rec_id, recruiter in recruiters.items():
-        recruiter_hiring_events[rec_id] = generate_poisson_hiring_events(
-            recruiter, simulation_days, n_simulations
-        )
-    
+    # Simulate each role
     role_completion_days = {}
+    base_seed = 42
+    
     for rec_id, rec_roles in recruiter_roles.items():
-        hiring_events = recruiter_hiring_events[rec_id]
+        recruiter = recruiters[rec_id]
         
         for queue_pos, role in enumerate(rec_roles):
+            role_seed = base_seed + hash(role.id) % 10000
+            
             completion_days = simulate_role_completion(
-                role, queue_pos, hiring_events
+                role=role,
+                queue_position=queue_pos,
+                recruiter=recruiter,
+                n_simulations=n_simulations,
+                seed=role_seed
             )
             role_completion_days[role.id] = completion_days
     
+    # Count missed deadlines per simulation
     missed_per_simulation = np.zeros(n_simulations)
     for role in roles:
         completion_days = role_completion_days[role.id]
@@ -695,15 +703,132 @@ st.markdown("""
     <div class="logo-text">◆ Acme Inc.</div>
     <h1>Hiring Feasibility Engine</h1>
     <p style="color: #94a3b8; font-size: 1.1rem;">Q1/Q2 Capacity Planning Dashboard — Statistically Validated</p>
-    <div style="display: inline-block; margin-top: 1rem; padding: 0.5rem 1.25rem; background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(255,255,255,0.1); border-radius: 9999px; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: #94a3b8;">
-        📅 {} | 🔢 {:,} Simulations
-    </div>
 </div>
-""".format(TODAY.strftime('%B %d, %Y'), SIMULATION_RUNS), unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# Load and process data
+# =============================================================================
+# FILE UPLOAD SECTION
+# =============================================================================
+
+with st.sidebar:
+    st.markdown("### 📁 Upload Data Files")
+    
+    uploaded_recruiters = st.file_uploader(
+        "Upload recruiters.json",
+        type=['json'],
+        help="JSON file containing recruiter data with id, name, and avg_monthly_capacity"
+    )
+    
+    uploaded_hiring_plan = st.file_uploader(
+        "Upload hiring_plan.json",
+        type=['json'],
+        help="JSON file containing roles with id, role, complexity, avg_days_to_hire, target_start_date, assigned_recruiter_id"
+    )
+    
+    st.markdown("---")
+
+# Check if files are uploaded
+if uploaded_recruiters is None or uploaded_hiring_plan is None:
+    # Show upload instructions
+    st.markdown("""
+    <div style="text-align: center; padding: 4rem 2rem;">
+        <div style="font-size: 4rem; margin-bottom: 1rem;">📊</div>
+        <h2 style="color: #f1f5f9; margin-bottom: 1rem;">Upload Your Hiring Data</h2>
+        <p style="color: #94a3b8; font-size: 1.1rem; max-width: 600px; margin: 0 auto 2rem auto;">
+            To generate your hiring feasibility analysis, please upload both required files 
+            using the sidebar on the left.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        <div style="background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 1.5rem;">
+            <h4 style="color: #22d3ee; margin: 0 0 1rem 0;">📋 recruiters.json</h4>
+            <p style="color: #94a3b8; font-size: 0.9rem; margin: 0;">
+                List of recruiters with their hiring capacity.
+            </p>
+            <pre style="background: rgba(15, 23, 42, 0.8); padding: 1rem; border-radius: 8px; margin-top: 1rem; font-size: 0.8rem; color: #e2e8f0; overflow-x: auto;">
+[
+  {
+    "id": "R_01",
+    "name": "Sarah (Lead)",
+    "avg_monthly_capacity": 4.5
+  },
+  ...
+]</pre>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("""
+        <div style="background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 1.5rem;">
+            <h4 style="color: #22d3ee; margin: 0 0 1rem 0;">📋 hiring_plan.json</h4>
+            <p style="color: #94a3b8; font-size: 0.9rem; margin: 0;">
+                List of roles to be filled with deadlines.
+            </p>
+            <pre style="background: rgba(15, 23, 42, 0.8); padding: 1rem; border-radius: 8px; margin-top: 1rem; font-size: 0.8rem; color: #e2e8f0; overflow-x: auto;">
+[
+  {
+    "id": "JOB_001",
+    "role": "Staff Backend Engineer",
+    "complexity": "High",
+    "avg_days_to_hire": 75,
+    "target_start_date": "2026-04-15",
+    "assigned_recruiter_id": "R_01"
+  },
+  ...
+]</pre>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.markdown("""
+    <div style="text-align: center; color: #64748b; padding: 1rem;">
+        <p>Once both files are uploaded, the analysis will run automatically.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.stop()  # Stop execution here until files are uploaded
+
+# =============================================================================
+# PROCESS UPLOADED DATA
+# =============================================================================
+
+try:
+    recruiters_json = uploaded_recruiters.read().decode('utf-8')
+    hiring_plan_json = uploaded_hiring_plan.read().decode('utf-8')
+    
+    recruiters, roles = parse_uploaded_data(recruiters_json, hiring_plan_json)
+    
+    # Validate data
+    is_valid, validation_message = validate_data(recruiters, roles)
+    
+    if not is_valid:
+        st.error(f"❌ Data Validation Failed:\n{validation_message}")
+        st.stop()
+
+except json.JSONDecodeError as e:
+    st.error(f"❌ Invalid JSON format: {str(e)}")
+    st.stop()
+except KeyError as e:
+    st.error(f"❌ Missing required field: {str(e)}")
+    st.stop()
+except Exception as e:
+    st.error(f"❌ Error processing files: {str(e)}")
+    st.stop()
+
+# Show success message
+st.markdown(f"""
+<div style="display: inline-block; margin-bottom: 1rem; padding: 0.5rem 1.25rem; background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(255,255,255,0.1); border-radius: 9999px; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: #94a3b8;">
+    📅 {TODAY.strftime('%B %d, %Y')} | 🔢 {SIMULATION_RUNS:,} Simulations | 👥 {len(recruiters)} Recruiters | 📋 {len(roles)} Roles
+</div>
+""", unsafe_allow_html=True)
+
+# Run simulation
 with st.spinner('🔄 Running Monte Carlo simulation...'):
-    recruiters, roles = load_data()
     simulation_results = run_monte_carlo_simulation(recruiters, roles)
     results = analyze_results(recruiters, roles, simulation_results)
     bottlenecks = identify_bottlenecks(recruiters, roles, results)
@@ -715,9 +840,9 @@ high_risk = sum(1 for r in results['role_analyses'] if r.on_time_probability < 0
 at_risk = sum(1 for r in results['role_analyses'] if 0.5 <= r.on_time_probability < 0.75)
 on_track = sum(1 for r in results['role_analyses'] if r.on_time_probability >= 0.75)
 
-# Sidebar
+# Sidebar - Results Summary
 with st.sidebar:
-    st.markdown("### 📊 Quick Summary")
+    st.markdown("### 📊 Analysis Results")
     
     success_rate = results['overall_success_rate']
     if success_rate >= 0.75:
