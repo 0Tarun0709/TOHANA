@@ -148,6 +148,8 @@ The AI analyzes your data and provides:
 ├── data/                  # Sample data files
 │   ├── recruiters.json
 │   └── hiring_plan.json
+├── doc/                   # Documentation
+│   └── METHODOLOGY.md     # Mathematical model explanation
 └── src/                   # Source modules
     ├── __init__.py
     ├── config.py          # Constants (simulation runs, etc.)
@@ -162,6 +164,8 @@ The AI analyzes your data and provides:
 ---
 
 ## How It Works
+
+> 📖 For detailed math and methodology, see [doc/METHODOLOGY.md](doc/METHODOLOGY.md)
 
 ### Simulation Model
 

@@ -1,11 +1,8 @@
 """LLM integration using OpenRouter for AI-powered recommendations."""
 
 import os
-import json
 from typing import Dict, List, Optional
-import requests
-
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+from openai import OpenAI
 
 
 def get_ai_recommendations(
@@ -13,8 +10,8 @@ def get_ai_recommendations(
     bottlenecks: List[Dict],
     recruiters: Dict,
     api_key: Optional[str] = None,
-    model: str = "anthropic/claude-3.5-sonnet"
-) -> Optional[str]:
+    model: str = "anthropic/claude-sonnet-4"
+) -> tuple[Optional[str], Optional[str]]:
     """
     Generate AI-powered recommendations using OpenRouter.
     
@@ -23,22 +20,24 @@ def get_ai_recommendations(
         bottlenecks: Identified bottlenecks
         recruiters: Recruiter data
         api_key: OpenRouter API key (or from env OPENROUTER_API_KEY)
-        model: Model to use (default: claude-3.5-sonnet)
+        model: Model to use
     
     Returns:
-        AI-generated recommendations as markdown string, or None if failed
+        Tuple of (response_content, error_message)
     """
     api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
     
     if not api_key:
-        return None
+        return None, "No API key provided"
     
     # Prepare context for the LLM
     context = _build_context(results, bottlenecks, recruiters)
     
-    prompt = f"""You are a hiring operations expert. Analyze this hiring plan data and provide actionable recommendations.
+    system_prompt = """You are a hiring operations expert. Analyze hiring plan data and provide actionable recommendations.
+Be specific. Reference actual role IDs, recruiter names, and numbers from the data.
+Format your response in clean markdown."""
 
-## Current Situation
+    user_prompt = f"""## Current Situation
 
 {context}
 
@@ -50,39 +49,38 @@ Based on this data, provide:
 2. **Top 3 Priority Actions** - Specific, actionable steps with expected impact
 3. **Risk Mitigation** - How to handle the highest-risk roles
 4. **Resource Optimization** - How to better distribute workload
-5. **Timeline Adjustments** - Which deadlines should be reconsidered
-
-Be specific. Reference actual role IDs, recruiter names, and numbers from the data.
-Format your response in clean markdown."""
+5. **Timeline Adjustments** - Which deadlines should be reconsidered"""
 
     try:
-        response = requests.post(
-            OPENROUTER_API_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://hiring-feasibility-engine.local",
-                "X-Title": "Hiring Feasibility Engine"
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 1500,
-                "temperature": 0.7
-            },
-            timeout=30
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key
         )
         
-        if response.status_code == 200:
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=1500,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content, None
+        
+    except Exception as e:
+        error_msg = str(e)
+        if "401" in error_msg:
+            return None, "Invalid API key. Check your OpenRouter API key."
+        elif "404" in error_msg:
+            return None, f"Model '{model}' not found. Try a different model."
+        elif "timeout" in error_msg.lower():
+            return None, "Request timed out. Try a faster model."
+        elif "connection" in error_msg.lower():
+            return None, "Connection error. Check your internet connection."
         else:
-            return None
-            
-    except Exception:
-        return None
+            return None, f"Error: {error_msg}"
 
 
 def _build_context(results: Dict, bottlenecks: List[Dict], recruiters: Dict) -> str:
@@ -130,10 +128,10 @@ def _build_context(results: Dict, bottlenecks: List[Dict], recruiters: Dict) -> 
 def get_available_models() -> List[Dict]:
     """Return list of recommended models for this use case."""
     return [
-        {"id": "anthropic/claude-3.5-sonnet", "name": "Claude 3.5 Sonnet (Recommended)"},
-        {"id": "anthropic/claude-3-haiku", "name": "Claude 3 Haiku (Fast)"},
+        {"id": "anthropic/claude-sonnet-4", "name": "Claude Sonnet 4 (Recommended)"},
+        {"id": "anthropic/claude-3.5-haiku", "name": "Claude 3.5 Haiku (Fast)"},
         {"id": "openai/gpt-4o", "name": "GPT-4o"},
         {"id": "openai/gpt-4o-mini", "name": "GPT-4o Mini (Fast)"},
-        {"id": "google/gemini-pro-1.5", "name": "Gemini Pro 1.5"},
-        {"id": "meta-llama/llama-3.1-70b-instruct", "name": "Llama 3.1 70B"},
+        {"id": "google/gemini-2.0-flash-001", "name": "Gemini 2.0 Flash"},
+        {"id": "meta-llama/llama-3.3-70b-instruct", "name": "Llama 3.3 70B"},
     ]

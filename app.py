@@ -564,8 +564,8 @@ with tab3:
     
     if api_key:
         if st.button("🚀 Generate AI Recommendations", type="primary"):
-            with st.spinner("Generating AI insights..."):
-                ai_response = get_ai_recommendations(
+            with st.spinner("Generating AI insights... (this may take 30-60 seconds)"):
+                ai_response, error = get_ai_recommendations(
                     results=results,
                     bottlenecks=bottlenecks,
                     recruiters=recruiters,
@@ -581,7 +581,7 @@ with tab3:
                 """, unsafe_allow_html=True)
                 st.markdown(ai_response)
             else:
-                st.error("Failed to generate AI recommendations. Please check your API key.")
+                st.error(f"Failed to generate AI recommendations: {error}")
     else:
         st.info("💡 Enter your OpenRouter API key above to get AI-powered recommendations tailored to your data.")
     
