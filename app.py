@@ -1,528 +1,22 @@
 """
 Hiring Feasibility Engine - Capacity Planning Dashboard
-Uses Monte Carlo simulation with proper Poisson process and Gamma distribution modeling.
-
-Mathematical Framework:
-- Poisson Process: Models hiring events over time (λ = avg_monthly_capacity)
-- Gamma Distribution: Models completion time variability (shape k varies by complexity)
-- Priority Queue: Roles sorted by urgency, capacity split across parallel work
+Main Streamlit application.
 """
 
 import json
-from datetime import datetime, date, timedelta
-from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from datetime import timedelta
 import numpy as np
-from scipy import stats as stats_module
-import streamlit as st
 import pandas as pd
+import streamlit as st
+
+from src.config import TODAY, SIMULATION_RUNS, SIMULATION_MONTHS
+from src.data_loader import parse_uploaded_data, validate_data
+from src.simulation import run_monte_carlo_simulation
+from src.analysis import analyze_results, identify_bottlenecks, analyze_complexity_impact
+from src.recommendations import generate_recommendations
 
 # =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-TODAY = date.today()
-SIMULATION_RUNS = 5000
-SIMULATION_MONTHS = 6
-
-COMPLEXITY_SHAPE_K = {
-    "Low": 4.0,
-    "Medium": 2.5,
-    "High": 1.5
-}
-
-# =============================================================================
-# DATA MODELS
-# =============================================================================
-
-@dataclass
-class Recruiter:
-    id: str
-    name: str
-    avg_monthly_capacity: float
-    
-    @property
-    def daily_rate(self) -> float:
-        return self.avg_monthly_capacity / 30.44
-    
-    @property
-    def mean_days_between_hires(self) -> float:
-        return 30.44 / self.avg_monthly_capacity
-
-@dataclass
-class Role:
-    id: str
-    role: str
-    complexity: str
-    avg_days_to_hire: int
-    target_start_date: date
-    assigned_recruiter_id: str
-    
-    @property
-    def days_until_deadline(self) -> int:
-        return (self.target_start_date - TODAY).days
-    
-    @property
-    def urgency_score(self) -> float:
-        return self.days_until_deadline - self.avg_days_to_hire
-    
-    @property
-    def gamma_shape(self) -> float:
-        return COMPLEXITY_SHAPE_K.get(self.complexity, 2.5)
-    
-    @property
-    def gamma_scale(self) -> float:
-        return self.avg_days_to_hire / self.gamma_shape
-
-@dataclass
-class SimulationResult:
-    role_id: str
-    role_name: str
-    recruiter_name: str
-    recruiter_id: str
-    target_date: date
-    complexity: str
-    urgency_score: float
-    mean_completion_days: float
-    std_completion_days: float
-    p10_completion_days: float
-    p50_completion_days: float
-    p90_completion_days: float
-    on_time_probability: float
-    on_time_ci_lower: float
-    on_time_ci_upper: float
-
-# =============================================================================
-# DATA LOADING
-# =============================================================================
-
-@st.cache_data
-def parse_uploaded_data(recruiters_json: str, hiring_plan_json: str) -> Tuple[Dict[str, Recruiter], List[Role]]:
-    """Parse uploaded JSON data into Recruiter and Role objects."""
-    recruiters_data = json.loads(recruiters_json)
-    roles_data = json.loads(hiring_plan_json)
-    
-    recruiters = {
-        r['id']: Recruiter(
-            id=r['id'],
-            name=r['name'],
-            avg_monthly_capacity=r['avg_monthly_capacity']
-        )
-        for r in recruiters_data
-    }
-    
-    roles = [
-        Role(
-            id=r['id'],
-            role=r['role'],
-            complexity=r['complexity'],
-            avg_days_to_hire=r['avg_days_to_hire'],
-            target_start_date=datetime.strptime(r['target_start_date'], '%Y-%m-%d').date(),
-            assigned_recruiter_id=r['assigned_recruiter_id']
-        )
-        for r in roles_data
-    ]
-    
-    return recruiters, roles
-
-def validate_data(recruiters: Dict, roles: List) -> Tuple[bool, str]:
-    """Validate uploaded data for consistency."""
-    errors = []
-    
-    # Check if all assigned recruiters exist
-    for role in roles:
-        if role.assigned_recruiter_id not in recruiters:
-            errors.append(f"Role {role.id} assigned to unknown recruiter {role.assigned_recruiter_id}")
-    
-    # Check for required fields
-    if not recruiters:
-        errors.append("No recruiters found in uploaded file")
-    if not roles:
-        errors.append("No roles found in uploaded file")
-    
-    if errors:
-        return False, "\n".join(errors)
-    return True, f"✅ Loaded {len(recruiters)} recruiters and {len(roles)} roles"
-
-# =============================================================================
-# MONTE CARLO SIMULATION ENGINE
-# =============================================================================
-
-def simulate_role_completion(role: Role, queue_position: int, 
-                            recruiter: Recruiter, n_simulations: int,
-                            seed: int = None) -> np.ndarray:
-    """Simulate completion times for a role."""
-    rng = np.random.default_rng(seed)
-    
-    # Queue wait time based on position and recruiter capacity
-    monthly_capacity = recruiter.avg_monthly_capacity
-    expected_wait_months = queue_position / monthly_capacity
-    expected_wait_days = expected_wait_months * 30.44
-    
-    if expected_wait_days > 1:
-        wait_shape = 2.0
-        wait_scale = expected_wait_days / wait_shape
-        queue_wait = rng.gamma(shape=wait_shape, scale=wait_scale, size=n_simulations)
-    else:
-        queue_wait = np.zeros(n_simulations)
-    
-    # Process time with variability based on complexity
-    process_shape = role.gamma_shape
-    process_scale = role.avg_days_to_hire / process_shape
-    process_time = rng.gamma(shape=process_shape, scale=process_scale, size=n_simulations)
-    
-    return queue_wait + process_time
-
-
-@st.cache_data
-def run_monte_carlo_simulation(_recruiters: dict, _roles: list, 
-                               n_simulations: int = SIMULATION_RUNS) -> Dict:
-    """Run Monte Carlo simulation for the entire hiring plan."""
-    recruiters = _recruiters
-    roles = _roles
-    
-    # Group roles by recruiter and sort by urgency
-    recruiter_roles: Dict[str, List[Role]] = {}
-    for role in roles:
-        rec_id = role.assigned_recruiter_id
-        if rec_id not in recruiter_roles:
-            recruiter_roles[rec_id] = []
-        recruiter_roles[rec_id].append(role)
-    
-    for rec_id in recruiter_roles:
-        recruiter_roles[rec_id].sort(key=lambda r: r.urgency_score)
-    
-    # Simulate each role
-    role_completion_days = {}
-    base_seed = 42
-    
-    for rec_id, rec_roles in recruiter_roles.items():
-        recruiter = recruiters[rec_id]
-        
-        for queue_pos, role in enumerate(rec_roles):
-            role_seed = base_seed + hash(role.id) % 10000
-            
-            completion_days = simulate_role_completion(
-                role=role,
-                queue_position=queue_pos,
-                recruiter=recruiter,
-                n_simulations=n_simulations,
-                seed=role_seed
-            )
-            role_completion_days[role.id] = completion_days
-    
-    # Count missed deadlines per simulation
-    missed_per_simulation = np.zeros(n_simulations)
-    for role in roles:
-        completion_days = role_completion_days[role.id]
-        deadline_days = role.days_until_deadline
-        missed_per_simulation += (completion_days > deadline_days).astype(int)
-    
-    return {
-        'role_completion_days': role_completion_days,
-        'missed_per_simulation': missed_per_simulation
-    }
-
-# =============================================================================
-# STATISTICAL ANALYSIS
-# =============================================================================
-
-def calculate_confidence_interval(successes: int, trials: int, 
-                                  confidence: float = 0.95) -> Tuple[float, float]:
-    if trials == 0:
-        return (0.0, 1.0)
-    
-    p = successes / trials
-    z = stats_module.norm.ppf((1 + confidence) / 2)
-    
-    denominator = 1 + z**2 / trials
-    center = (p + z**2 / (2 * trials)) / denominator
-    margin = z * np.sqrt((p * (1 - p) + z**2 / (4 * trials)) / trials) / denominator
-    
-    return (max(0, center - margin), min(1, center + margin))
-
-def analyze_results(recruiters: dict, roles: list, 
-                   simulation_results: dict) -> Dict:
-    role_completion_days = simulation_results['role_completion_days']
-    missed_per_simulation = simulation_results['missed_per_simulation']
-    n_sims = SIMULATION_RUNS
-    
-    role_analyses = []
-    on_time_probs = []
-    
-    for role in roles:
-        completion_days = role_completion_days[role.id]
-        deadline_days = role.days_until_deadline
-        
-        on_time_count = int(np.sum(completion_days <= deadline_days))
-        on_time_prob = on_time_count / n_sims
-        on_time_probs.append(on_time_prob)
-        
-        ci_lower, ci_upper = calculate_confidence_interval(on_time_count, n_sims)
-        
-        mean_completion = np.mean(completion_days)
-        std_completion = np.std(completion_days)
-        p10_completion = np.percentile(completion_days, 10)
-        p50_completion = np.percentile(completion_days, 50)
-        p90_completion = np.percentile(completion_days, 90)
-        
-        recruiter = recruiters[role.assigned_recruiter_id]
-        
-        role_analyses.append(SimulationResult(
-            role_id=role.id,
-            role_name=role.role,
-            recruiter_name=recruiter.name,
-            recruiter_id=recruiter.id,
-            target_date=role.target_start_date,
-            complexity=role.complexity,
-            urgency_score=role.urgency_score,
-            mean_completion_days=mean_completion,
-            std_completion_days=std_completion,
-            p10_completion_days=p10_completion,
-            p50_completion_days=p50_completion,
-            p90_completion_days=p90_completion,
-            on_time_probability=on_time_prob,
-            on_time_ci_lower=ci_lower,
-            on_time_ci_upper=ci_upper
-        ))
-    
-    overall_success_rate = np.mean(on_time_probs)
-    success_rate_std = np.std(on_time_probs) / np.sqrt(len(roles))
-    success_rate_ci = (
-        overall_success_rate - 1.96 * success_rate_std,
-        overall_success_rate + 1.96 * success_rate_std
-    )
-    
-    critical_failures = np.sum(missed_per_simulation > 5)
-    critical_failure_prob = critical_failures / n_sims
-    critical_ci = calculate_confidence_interval(int(critical_failures), n_sims)
-    
-    expected_missed = np.mean(missed_per_simulation)
-    missed_std = np.std(missed_per_simulation)
-    p50_missed = np.percentile(missed_per_simulation, 50)
-    p90_missed = np.percentile(missed_per_simulation, 90)
-    p95_missed = np.percentile(missed_per_simulation, 95)
-    p99_missed = np.percentile(missed_per_simulation, 99)
-    
-    var_90 = np.percentile(missed_per_simulation, 90)
-    var_95 = np.percentile(missed_per_simulation, 95)
-    
-    worst_10_pct = missed_per_simulation[missed_per_simulation >= var_90]
-    cvar_90 = np.mean(worst_10_pct) if len(worst_10_pct) > 0 else var_90
-    
-    return {
-        'role_analyses': role_analyses,
-        'overall_success_rate': overall_success_rate,
-        'success_rate_ci': success_rate_ci,
-        'critical_failure_prob': critical_failure_prob,
-        'critical_failure_ci': critical_ci,
-        'expected_missed': expected_missed,
-        'missed_std': missed_std,
-        'p50_missed': p50_missed,
-        'p90_missed': p90_missed,
-        'p95_missed': p95_missed,
-        'p99_missed': p99_missed,
-        'var_90': var_90,
-        'var_95': var_95,
-        'cvar_90': cvar_90,
-        'missed_distribution': missed_per_simulation
-    }
-
-def identify_bottlenecks(recruiters: dict, roles: list, results: dict) -> List[Dict]:
-    role_analyses = results['role_analyses']
-    overall_avg = results['overall_success_rate']
-    
-    recruiter_stats = {}
-    for result in role_analyses:
-        rec_id = result.recruiter_id
-        if rec_id not in recruiter_stats:
-            recruiter_stats[rec_id] = {
-                'name': result.recruiter_name,
-                'roles': [],
-                'probs': []
-            }
-        recruiter_stats[rec_id]['roles'].append(result)
-        recruiter_stats[rec_id]['probs'].append(result.on_time_probability)
-    
-    bottlenecks = []
-    for rec_id, stats in recruiter_stats.items():
-        probs = stats['probs']
-        recruiter_avg = np.mean(probs)
-        
-        if len(probs) >= 2:
-            _, p_value = stats_module.ttest_1samp(probs, overall_avg)
-            significant = p_value < 0.05 and recruiter_avg < overall_avg
-        else:
-            p_value = 1.0
-            significant = False
-        
-        failure_rate = 1 - recruiter_avg
-        overall_failure_rate = 1 - overall_avg
-        failure_ratio = failure_rate / overall_failure_rate if overall_failure_rate > 0 else 1.0
-        
-        worst_role = min(stats['roles'], key=lambda r: r.on_time_probability)
-        
-        at_risk = sum(1 for p in probs if p < 0.7)
-        high_risk = sum(1 for p in probs if p < 0.5)
-        
-        rec_loads = {r: len(recruiter_stats.get(r, {}).get('roles', [])) 
-                    for r in recruiters.keys()}
-        rec_avgs = {r: np.mean(recruiter_stats.get(r, {}).get('probs', [1.0])) 
-                   for r in recruiters.keys()}
-        
-        current_rec_avgs = rec_avgs.copy()
-        current_rec_loads = rec_loads.copy()
-        best_alt_id = max(
-            [r for r in recruiters.keys() if r != rec_id],
-            key=lambda r, avgs=current_rec_avgs, loads=current_rec_loads: avgs.get(r, 0) - loads.get(r, 0) * 0.1
-        )
-        best_alternative = recruiters[best_alt_id]
-        
-        alt_avg = rec_avgs.get(best_alt_id, overall_avg)
-        potential_improvement = (alt_avg - worst_role.on_time_probability) * 0.5
-        
-        if at_risk >= 2 or significant or recruiter_avg < 0.6:
-            bottlenecks.append({
-                'recruiter_id': rec_id,
-                'recruiter': stats['name'],
-                'role_count': len(stats['roles']),
-                'at_risk_count': at_risk,
-                'high_risk_count': high_risk,
-                'avg_success_prob': recruiter_avg,
-                'failure_ratio': failure_ratio,
-                'p_value': p_value,
-                'statistically_significant': significant,
-                'worst_role': worst_role,
-                'recommendation': f"Reassign **{worst_role.role_id}** ({worst_role.role_name}) to **{best_alternative.name}**",
-                'potential_improvement': max(0, potential_improvement),
-                'alternative_recruiter': best_alternative.name
-            })
-    
-    bottlenecks.sort(key=lambda b: -b['failure_ratio'])
-    return bottlenecks
-
-def analyze_complexity_impact(results: dict) -> Dict:
-    role_analyses = results['role_analyses']
-    
-    complexity_stats = {}
-    for complexity in ['Low', 'Medium', 'High']:
-        roles = [r for r in role_analyses if r.complexity == complexity]
-        if roles:
-            probs = [r.on_time_probability for r in roles]
-            complexity_stats[complexity] = {
-                'count': len(roles),
-                'avg_success': np.mean(probs),
-                'std_success': np.std(probs),
-                'min_success': np.min(probs),
-                'max_success': np.max(probs)
-            }
-    
-    return complexity_stats
-
-def generate_recommendations(recruiters: dict, roles: list, results: dict, bottlenecks: list) -> List[Dict]:
-    """Generate actionable recommendations based on analysis."""
-    recommendations = []
-    
-    # 1. Role Reassignment Recommendations
-    for b in bottlenecks[:3]:
-        recommendations.append({
-            'type': 'reassignment',
-            'priority': 'High' if b['high_risk_count'] >= 2 else 'Medium',
-            'title': f"Reassign {b['worst_role'].role_id} from {b['recruiter']}",
-            'description': f"Move **{b['worst_role'].role_name}** to **{b['alternative_recruiter']}** to reduce bottleneck",
-            'impact': f"+{b['potential_improvement']*100:.0f}% success probability for this role",
-            'effort': 'Low',
-            'details': {
-                'current_success': b['worst_role'].on_time_probability * 100,
-                'current_recruiter': b['recruiter'],
-                'suggested_recruiter': b['alternative_recruiter']
-            }
-        })
-    
-    # 2. Deadline Extension Recommendations
-    high_risk_roles = [r for r in results['role_analyses'] if r.on_time_probability < 0.5]
-    if high_risk_roles:
-        urgent_roles = sorted(high_risk_roles, key=lambda r: r.urgency_score)[:3]
-        for role in urgent_roles:
-            days_needed = int(role.p90_completion_days - role.target_date.toordinal() + TODAY.toordinal())
-            if days_needed > 0:
-                recommendations.append({
-                    'type': 'deadline',
-                    'priority': 'High' if role.on_time_probability < 0.3 else 'Medium',
-                    'title': f"Extend deadline for {role.role_id}",
-                    'description': f"**{role.role_name}** has only {role.on_time_probability*100:.0f}% chance of meeting deadline",
-                    'impact': f"Extending by {days_needed + 7} days would increase success to ~80%",
-                    'effort': 'Medium (requires stakeholder approval)',
-                    'details': {
-                        'current_deadline': role.target_date.strftime('%Y-%m-%d'),
-                        'suggested_extension': days_needed + 7,
-                        'current_success': role.on_time_probability * 100
-                    }
-                })
-    
-    # 3. Capacity Recommendations
-    recruiter_utilization = {}
-    for rec_id, rec in recruiters.items():
-        rec_roles = [r for r in results['role_analyses'] if r.recruiter_id == rec_id]
-        if rec_roles:
-            total_capacity = rec.avg_monthly_capacity * SIMULATION_MONTHS
-            utilization = len(rec_roles) / total_capacity * 100
-            recruiter_utilization[rec_id] = {
-                'name': rec.name,
-                'utilization': utilization,
-                'roles': len(rec_roles)
-            }
-    
-    overloaded = [r for r in recruiter_utilization.values() if r['utilization'] > 100]
-    if overloaded:
-        recommendations.append({
-            'type': 'capacity',
-            'priority': 'High',
-            'title': 'Consider adding recruiting capacity',
-            'description': f"{len(overloaded)} recruiter(s) are operating above 100% utilization",
-            'impact': 'Adding 1 recruiter could improve overall success rate by ~10-15%',
-            'effort': 'High (budget and hiring required)',
-            'details': {
-                'overloaded_recruiters': [r['name'] for r in overloaded]
-            }
-        })
-    
-    # 4. Complexity-based Recommendations
-    complexity_impact = analyze_complexity_impact(results)
-    if 'High' in complexity_impact and complexity_impact['High']['avg_success'] < 0.6:
-        recommendations.append({
-            'type': 'process',
-            'priority': 'Medium',
-            'title': 'Improve high-complexity hiring process',
-            'description': f"High-complexity roles have only {complexity_impact['High']['avg_success']*100:.0f}% average success",
-            'impact': 'Reducing avg_days_to_hire by 10% could improve success by ~8%',
-            'effort': 'Medium (process optimization needed)',
-            'details': {
-                'high_complexity_count': complexity_impact['High']['count'],
-                'current_success': complexity_impact['High']['avg_success'] * 100
-            }
-        })
-    
-    # 5. Quick Wins
-    quick_wins = [r for r in results['role_analyses'] 
-                  if 0.6 <= r.on_time_probability < 0.75 and r.urgency_score > 10]
-    if quick_wins:
-        recommendations.append({
-            'type': 'quick_win',
-            'priority': 'Low',
-            'title': f"{len(quick_wins)} roles are close to success threshold",
-            'description': 'These roles are at 60-75% success with buffer time — small improvements can push them to green',
-            'impact': 'Minor adjustments could convert these to "On Track" status',
-            'effort': 'Low',
-            'details': {
-                'role_ids': [r.role_id for r in quick_wins[:5]]
-            }
-        })
-    
-    return recommendations
-
-# =============================================================================
-# STREAMLIT APP
+# STREAMLIT APP CONFIGURATION
 # =============================================================================
 
 st.set_page_config(
@@ -532,7 +26,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
+# =============================================================================
+# CUSTOM STYLES
+# =============================================================================
+
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
@@ -618,17 +115,9 @@ st.markdown("""
         transform: translateY(-2px);
     }
     
-    .recommendation-card.high {
-        border-left: 4px solid #f43f5e;
-    }
-    
-    .recommendation-card.medium {
-        border-left: 4px solid #f59e0b;
-    }
-    
-    .recommendation-card.low {
-        border-left: 4px solid #10b981;
-    }
+    .recommendation-card.high { border-left: 4px solid #f43f5e; }
+    .recommendation-card.medium { border-left: 4px solid #f59e0b; }
+    .recommendation-card.low { border-left: 4px solid #10b981; }
     
     .priority-badge {
         display: inline-block;
@@ -639,20 +128,9 @@ st.markdown("""
         text-transform: uppercase;
     }
     
-    .priority-badge.high {
-        background: rgba(244, 63, 94, 0.2);
-        color: #f43f5e;
-    }
-    
-    .priority-badge.medium {
-        background: rgba(245, 158, 11, 0.2);
-        color: #f59e0b;
-    }
-    
-    .priority-badge.low {
-        background: rgba(16, 185, 129, 0.2);
-        color: #10b981;
-    }
+    .priority-badge.high { background: rgba(244, 63, 94, 0.2); color: #f43f5e; }
+    .priority-badge.medium { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
+    .priority-badge.low { background: rgba(16, 185, 129, 0.2); color: #10b981; }
     
     .type-badge {
         display: inline-block;
@@ -673,14 +151,6 @@ st.markdown("""
         margin-top: 0.75rem;
     }
     
-    .recruiter-detail-card {
-        background: rgba(30, 41, 59, 0.6);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 16px;
-        padding: 1.5rem;
-        margin-bottom: 1.5rem;
-    }
-    
     .section-header {
         font-family: 'DM Sans', sans-serif;
         font-size: 1.5rem;
@@ -691,23 +161,24 @@ st.markdown("""
         margin-bottom: 1.5rem;
     }
     
-    .tab-content {
-        padding-top: 1rem;
-    }
+    .tab-content { padding-top: 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# Header
+# =============================================================================
+# HEADER
+# =============================================================================
+
 st.markdown("""
 <div class="main-header">
     <div class="logo-text">◆ Acme Inc.</div>
     <h1>Hiring Feasibility Engine</h1>
-    <p style="color: #94a3b8; font-size: 1.1rem;">Q1/Q2 Capacity Planning Dashboard — Statistically Validated</p>
+    <p style="color: #94a3b8; font-size: 1.1rem;">Q1/Q2 Capacity Planning Dashboard</p>
 </div>
 """, unsafe_allow_html=True)
 
 # =============================================================================
-# FILE UPLOAD SECTION
+# FILE UPLOAD
 # =============================================================================
 
 with st.sidebar:
@@ -716,27 +187,25 @@ with st.sidebar:
     uploaded_recruiters = st.file_uploader(
         "Upload recruiters.json",
         type=['json'],
-        help="JSON file containing recruiter data with id, name, and avg_monthly_capacity"
+        help="JSON file containing recruiter data"
     )
     
     uploaded_hiring_plan = st.file_uploader(
         "Upload hiring_plan.json",
         type=['json'],
-        help="JSON file containing roles with id, role, complexity, avg_days_to_hire, target_start_date, assigned_recruiter_id"
+        help="JSON file containing roles data"
     )
     
     st.markdown("---")
 
 # Check if files are uploaded
 if uploaded_recruiters is None or uploaded_hiring_plan is None:
-    # Show upload instructions
     st.markdown("""
     <div style="text-align: center; padding: 4rem 2rem;">
         <div style="font-size: 4rem; margin-bottom: 1rem;">📊</div>
         <h2 style="color: #f1f5f9; margin-bottom: 1rem;">Upload Your Hiring Data</h2>
         <p style="color: #94a3b8; font-size: 1.1rem; max-width: 600px; margin: 0 auto 2rem auto;">
-            To generate your hiring feasibility analysis, please upload both required files 
-            using the sidebar on the left.
+            Upload both JSON files using the sidebar to generate your hiring feasibility analysis.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -747,17 +216,13 @@ if uploaded_recruiters is None or uploaded_hiring_plan is None:
         st.markdown("""
         <div style="background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 1.5rem;">
             <h4 style="color: #22d3ee; margin: 0 0 1rem 0;">📋 recruiters.json</h4>
-            <p style="color: #94a3b8; font-size: 0.9rem; margin: 0;">
-                List of recruiters with their hiring capacity.
-            </p>
-            <pre style="background: rgba(15, 23, 42, 0.8); padding: 1rem; border-radius: 8px; margin-top: 1rem; font-size: 0.8rem; color: #e2e8f0; overflow-x: auto;">
+            <pre style="background: rgba(15, 23, 42, 0.8); padding: 1rem; border-radius: 8px; font-size: 0.8rem; color: #e2e8f0;">
 [
   {
     "id": "R_01",
     "name": "Sarah (Lead)",
     "avg_monthly_capacity": 4.5
-  },
-  ...
+  }
 ]</pre>
         </div>
         """, unsafe_allow_html=True)
@@ -766,35 +231,24 @@ if uploaded_recruiters is None or uploaded_hiring_plan is None:
         st.markdown("""
         <div style="background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 1.5rem;">
             <h4 style="color: #22d3ee; margin: 0 0 1rem 0;">📋 hiring_plan.json</h4>
-            <p style="color: #94a3b8; font-size: 0.9rem; margin: 0;">
-                List of roles to be filled with deadlines.
-            </p>
-            <pre style="background: rgba(15, 23, 42, 0.8); padding: 1rem; border-radius: 8px; margin-top: 1rem; font-size: 0.8rem; color: #e2e8f0; overflow-x: auto;">
+            <pre style="background: rgba(15, 23, 42, 0.8); padding: 1rem; border-radius: 8px; font-size: 0.8rem; color: #e2e8f0;">
 [
   {
     "id": "JOB_001",
-    "role": "Staff Backend Engineer",
+    "role": "Backend Engineer",
     "complexity": "High",
     "avg_days_to_hire": 75,
     "target_start_date": "2026-04-15",
     "assigned_recruiter_id": "R_01"
-  },
-  ...
+  }
 ]</pre>
         </div>
         """, unsafe_allow_html=True)
     
-    st.markdown("---")
-    st.markdown("""
-    <div style="text-align: center; color: #64748b; padding: 1rem;">
-        <p>Once both files are uploaded, the analysis will run automatically.</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.stop()  # Stop execution here until files are uploaded
+    st.stop()
 
 # =============================================================================
-# PROCESS UPLOADED DATA
+# PROCESS DATA
 # =============================================================================
 
 try:
@@ -803,7 +257,6 @@ try:
     
     recruiters, roles = parse_uploaded_data(recruiters_json, hiring_plan_json)
     
-    # Validate data
     is_valid, validation_message = validate_data(recruiters, roles)
     
     if not is_valid:
@@ -820,14 +273,17 @@ except Exception as e:
     st.error(f"❌ Error processing files: {str(e)}")
     st.stop()
 
-# Show success message
+# Show info badge
 st.markdown(f"""
 <div style="display: inline-block; margin-bottom: 1rem; padding: 0.5rem 1.25rem; background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(255,255,255,0.1); border-radius: 9999px; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: #94a3b8;">
     📅 {TODAY.strftime('%B %d, %Y')} | 🔢 {SIMULATION_RUNS:,} Simulations | 👥 {len(recruiters)} Recruiters | 📋 {len(roles)} Roles
 </div>
 """, unsafe_allow_html=True)
 
-# Run simulation
+# =============================================================================
+# RUN SIMULATION
+# =============================================================================
+
 with st.spinner('🔄 Running Monte Carlo simulation...'):
     simulation_results = run_monte_carlo_simulation(recruiters, roles)
     results = analyze_results(recruiters, roles, simulation_results)
@@ -840,7 +296,7 @@ high_risk = sum(1 for r in results['role_analyses'] if r.on_time_probability < 0
 at_risk = sum(1 for r in results['role_analyses'] if 0.5 <= r.on_time_probability < 0.75)
 on_track = sum(1 for r in results['role_analyses'] if r.on_time_probability >= 0.75)
 
-# Sidebar - Results Summary
+# Sidebar summary
 with st.sidebar:
     st.markdown("### 📊 Analysis Results")
     
@@ -860,8 +316,6 @@ with st.sidebar:
     st.markdown("### ⚙️ Configuration")
     st.caption(f"**Simulations:** {SIMULATION_RUNS:,}")
     st.caption(f"**Horizon:** {SIMULATION_MONTHS} months")
-    st.caption(f"**Recruiters:** {len(recruiters)}")
-    st.caption(f"**Total Roles:** {len(roles)}")
 
 # =============================================================================
 # TABS
@@ -874,55 +328,28 @@ tab1, tab2, tab3 = st.tabs(["📈 Overview", "👥 Recruiter Analysis", "💡 Re
 # =============================================================================
 
 with tab1:
-    st.markdown('<div class="tab-content">', unsafe_allow_html=True)
-    
-    # Key Metrics
     st.markdown('<div class="section-header">🎯 Key Metrics</div>', unsafe_allow_html=True)
     
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         ci_low, ci_high = results['success_rate_ci']
-        st.metric(
-            label="Overall Success Rate",
-            value=f"{success_rate:.1%}",
-            delta="Good" if success_rate >= 0.75 else ("Warning" if success_rate >= 0.5 else "Critical")
-        )
+        st.metric("Overall Success Rate", f"{success_rate:.1%}")
         st.caption(f"95% CI: [{ci_low:.1%}, {ci_high:.1%}]")
     
     with col2:
-        crit_fail = results['critical_failure_prob']
-        st.metric(
-            label="Critical Failure Risk",
-            value=f"{crit_fail:.1%}",
-            delta=f"P(>5 missed)"
-        )
+        st.metric("Critical Failure Risk", f"{results['critical_failure_prob']:.1%}")
+        st.caption("P(>5 missed)")
     
     with col3:
-        st.metric(
-            label="Expected Missed",
-            value=f"{results['expected_missed']:.1f}",
-            delta=f"P90: {results['p90_missed']:.0f}"
-        )
+        st.metric("Expected Missed", f"{results['expected_missed']:.1f}")
+        st.caption(f"P90: {results['p90_missed']:.0f}")
     
     with col4:
-        st.metric(
-            label="CVaR (90%)",
-            value=f"{results['cvar_90']:.1f}",
-            delta="Worst 10% avg"
-        )
+        st.metric("CVaR (90%)", f"{results['cvar_90']:.1f}")
+        st.caption("Worst 10% avg")
     
     st.progress(min(success_rate, 1.0))
-    
-    with st.expander("📖 What do these metrics mean?"):
-        st.markdown("""
-        | Metric | Description | Good Value |
-        |--------|-------------|------------|
-        | **Success Rate** | Average probability roles start on time | ≥75% |
-        | **Critical Failure Risk** | Probability of missing >5 deadlines | ≤10% |
-        | **Expected Missed** | Average missed deadlines | As low as possible |
-        | **CVaR (90%)** | Average missed in worst 10% of scenarios | Lower is better |
-        """)
     
     st.markdown("---")
     
@@ -936,27 +363,23 @@ with tab1:
             st.markdown(f"""
             <div class="stat-card">
                 <h4 style="color: {color}; margin: 0;">{complexity} Complexity</h4>
-                <p style="font-size: 2rem; font-weight: 700; margin: 0.5rem 0; font-family: 'JetBrains Mono';">
-                    {stats['avg_success']*100:.1f}%
-                </p>
-                <p style="color: #94a3b8; margin: 0; font-size: 0.85rem;">
-                    {stats['count']} roles | σ = {stats['std_success']:.2f}
-                </p>
+                <p style="font-size: 2rem; font-weight: 700; margin: 0.5rem 0; font-family: 'JetBrains Mono';">{stats['avg_success']*100:.1f}%</p>
+                <p style="color: #94a3b8; margin: 0; font-size: 0.85rem;">{stats['count']} roles</p>
             </div>
             """, unsafe_allow_html=True)
     
     st.markdown("---")
     
     # Role Table
-    st.markdown('<div class="section-header">📋 Role-by-Role Analysis</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📋 Role Analysis</div>', unsafe_allow_html=True)
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        risk_filter = st.selectbox("Filter by Risk", ["All Roles", "🔴 High Risk", "🟡 At Risk", "🟢 On Track"], key="overview_risk")
+        risk_filter = st.selectbox("Filter by Risk", ["All Roles", "🔴 High Risk", "🟡 At Risk", "🟢 On Track"])
     with col2:
-        complexity_filter = st.selectbox("Filter by Complexity", ["All", "High", "Medium", "Low"], key="overview_complexity")
+        complexity_filter = st.selectbox("Filter by Complexity", ["All", "High", "Medium", "Low"])
     with col3:
-        recruiter_filter = st.selectbox("Filter by Recruiter", ["All"] + [r.name for r in recruiters.values()], key="overview_recruiter")
+        recruiter_filter = st.selectbox("Filter by Recruiter", ["All"] + [r.name for r in recruiters.values()])
     
     role_data = []
     for r in results['role_analyses']:
@@ -1022,31 +445,15 @@ with tab1:
         | P95 | {results['p95_missed']:.0f} |
         | P99 | {results['p99_missed']:.0f} |
         """)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # =============================================================================
 # TAB 2: RECRUITER ANALYSIS
 # =============================================================================
 
 with tab2:
-    st.markdown('<div class="tab-content">', unsafe_allow_html=True)
-    
-    st.markdown('<div class="section-header">👥 Recruiter Performance Analysis</div>', unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div class="explanation-box">
-        <h4>📖 About This Analysis</h4>
-        <p>
-            This section provides detailed insights into each recruiter's workload, performance, and assigned roles.
-            Use this to identify capacity issues and optimize role assignments.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown('<div class="section-header">👥 Recruiter Performance</div>', unsafe_allow_html=True)
     
     # Summary Table
-    st.markdown("### 📊 Performance Summary")
-    
     workload_data = []
     for rec_id, rec in recruiters.items():
         rec_roles = [r for r in results['role_analyses'] if r.recruiter_id == rec_id]
@@ -1083,20 +490,11 @@ with tab2:
     st.markdown("---")
     
     # Individual Recruiter Details
-    st.markdown("### 🔍 Individual Recruiter Details")
+    st.markdown("### 🔍 Recruiter Details")
     
-    selected_recruiter = st.selectbox(
-        "Select a recruiter to view details",
-        options=[r.name for r in recruiters.values()],
-        key="recruiter_detail_select"
-    )
+    selected_recruiter = st.selectbox("Select recruiter", [r.name for r in recruiters.values()])
     
-    # Find selected recruiter
-    selected_rec = None
-    for rec in recruiters.values():
-        if rec.name == selected_recruiter:
-            selected_rec = rec
-            break
+    selected_rec = next((r for r in recruiters.values() if r.name == selected_recruiter), None)
     
     if selected_rec:
         rec_roles = [r for r in results['role_analyses'] if r.recruiter_id == selected_rec.id]
@@ -1110,24 +508,21 @@ with tab2:
             st.metric("Monthly Capacity", f"{selected_rec.avg_monthly_capacity:.1f}")
         with col3:
             utilization = len(rec_roles) / (selected_rec.avg_monthly_capacity * SIMULATION_MONTHS) * 100
-            st.metric("Utilization", f"{utilization:.0f}%", delta="Overloaded" if utilization > 100 else "OK")
+            st.metric("Utilization", f"{utilization:.0f}%")
         with col4:
-            avg_success = np.mean(rec_probs) * 100
-            st.metric("Avg Success", f"{avg_success:.1f}%")
+            st.metric("Avg Success", f"{np.mean(rec_probs) * 100:.1f}%")
         
         st.markdown("#### Assigned Roles")
         
         rec_role_data = []
         for r in rec_roles:
-            risk = "🔴 High" if r.on_time_probability < 0.5 else ("🟡 Medium" if r.on_time_probability < 0.75 else "🟢 Low")
+            risk = "🔴" if r.on_time_probability < 0.5 else ("🟡" if r.on_time_probability < 0.75 else "🟢")
             rec_role_data.append({
                 'Role ID': r.role_id,
                 'Role': r.role_name,
                 'Complexity': r.complexity,
-                'Target Date': r.target_date.strftime('%Y-%m-%d'),
-                'Urgency': int(r.urgency_score),
+                'Target': r.target_date.strftime('%Y-%m-%d'),
                 'Success %': r.on_time_probability * 100,
-                'P50 Days': int(r.p50_completion_days),
                 'Risk': risk
             })
         
@@ -1138,61 +533,17 @@ with tab2:
             use_container_width=True,
             hide_index=True,
             column_config={
-                'Success %': st.column_config.ProgressColumn('Success %', format="%.1f%%", min_value=0, max_value=100),
-                'Urgency': st.column_config.NumberColumn('Urgency', help="Lower = more urgent")
+                'Success %': st.column_config.ProgressColumn('Success %', format="%.1f%%", min_value=0, max_value=100)
             }
         )
-        
-        # Performance Summary
-        st.markdown("#### Performance Breakdown")
-        
-        perf_col1, perf_col2 = st.columns(2)
-        
-        with perf_col1:
-            st.markdown(f"""
-            **By Complexity:**
-            """)
-            for complexity in ['Low', 'Medium', 'High']:
-                comp_roles = [r for r in rec_roles if r.complexity == complexity]
-                if comp_roles:
-                    comp_avg = np.mean([r.on_time_probability for r in comp_roles]) * 100
-                    color = "🟢" if comp_avg >= 75 else ("🟡" if comp_avg >= 50 else "🔴")
-                    st.write(f"{color} {complexity}: {comp_avg:.1f}% ({len(comp_roles)} roles)")
-        
-        with perf_col2:
-            st.markdown(f"""
-            **Risk Distribution:**
-            """)
-            high_risk_count = sum(1 for r in rec_roles if r.on_time_probability < 0.5)
-            at_risk_count = sum(1 for r in rec_roles if 0.5 <= r.on_time_probability < 0.75)
-            on_track_count = sum(1 for r in rec_roles if r.on_time_probability >= 0.75)
-            
-            st.write(f"🔴 High Risk: {high_risk_count}")
-            st.write(f"🟡 At Risk: {at_risk_count}")
-            st.write(f"🟢 On Track: {on_track_count}")
-    
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # =============================================================================
 # TAB 3: RECOMMENDATIONS
 # =============================================================================
 
 with tab3:
-    st.markdown('<div class="tab-content">', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">💡 Recommendations</div>', unsafe_allow_html=True)
     
-    st.markdown('<div class="section-header">💡 Actionable Recommendations</div>', unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div class="explanation-box">
-        <h4>📖 About These Recommendations</h4>
-        <p>
-            Based on our analysis of 10,000 simulations, we've identified specific actions that could improve 
-            your hiring plan's success rate. Recommendations are prioritized by potential impact and effort required.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Summary Stats
     col1, col2, col3 = st.columns(3)
     with col1:
         high_priority = sum(1 for r in recommendations if r['priority'] == 'High')
@@ -1206,152 +557,58 @@ with tab3:
     
     st.markdown("---")
     
-    # Filter
-    priority_filter = st.selectbox(
-        "Filter by Priority",
-        ["All", "High", "Medium", "Low"],
-        key="rec_priority_filter"
-    )
+    priority_filter = st.selectbox("Filter by Priority", ["All", "High", "Medium", "Low"])
     
     filtered_recs = recommendations
     if priority_filter != "All":
         filtered_recs = [r for r in recommendations if r['priority'] == priority_filter]
     
     if not filtered_recs:
-        st.info("No recommendations found for the selected filter.")
+        st.info("No recommendations found.")
     else:
-        for i, rec in enumerate(filtered_recs):
+        for rec in filtered_recs:
             priority_class = rec['priority'].lower()
             type_label = rec['type'].replace('_', ' ').title()
             
             st.markdown(f"""
             <div class="recommendation-card {priority_class}">
-                <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.75rem;">
-                    <div>
-                        <span class="priority-badge {priority_class}">{rec['priority']} Priority</span>
-                        <span class="type-badge">{type_label}</span>
-                    </div>
-                </div>
-                <h4 style="color: #f1f5f9; margin: 0 0 0.5rem 0;">{rec['title']}</h4>
+                <span class="priority-badge {priority_class}">{rec['priority']} Priority</span>
+                <span class="type-badge">{type_label}</span>
+                <h4 style="color: #f1f5f9; margin: 0.75rem 0 0.5rem 0;">{rec['title']}</h4>
                 <p style="color: #94a3b8; margin: 0;">{rec['description']}</p>
                 <div class="impact-box">
-                    <p style="color: #10b981; margin: 0; font-size: 0.9rem;">
-                        <strong>💰 Impact:</strong> {rec['impact']}
-                    </p>
-                    <p style="color: #94a3b8; margin: 0.25rem 0 0 0; font-size: 0.85rem;">
-                        <strong>⚡ Effort:</strong> {rec['effort']}
-                    </p>
+                    <p style="color: #10b981; margin: 0;"><strong>Impact:</strong> {rec['impact']}</p>
+                    <p style="color: #94a3b8; margin: 0.25rem 0 0 0;"><strong>Effort:</strong> {rec['effort']}</p>
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            
-            with st.expander(f"📊 View Details for: {rec['title'][:50]}..."):
-                if rec['type'] == 'reassignment':
-                    st.markdown(f"""
-                    **Current State:**
-                    - Current Recruiter: {rec['details']['current_recruiter']}
-                    - Current Success Rate: {rec['details']['current_success']:.1f}%
-                    
-                    **Suggested Change:**
-                    - Move to: {rec['details']['suggested_recruiter']}
-                    - Expected improvement in success probability
-                    
-                    **Why this works:** The suggested recruiter has lower utilization and/or better track record 
-                    with similar role types.
-                    """)
-                elif rec['type'] == 'deadline':
-                    st.markdown(f"""
-                    **Current State:**
-                    - Current Deadline: {rec['details']['current_deadline']}
-                    - Current Success Rate: {rec['details']['current_success']:.1f}%
-                    
-                    **Suggested Change:**
-                    - Extend deadline by: {rec['details']['suggested_extension']} days
-                    
-                    **Why this works:** More time allows for the natural variance in hiring process 
-                    without risking a miss.
-                    """)
-                elif rec['type'] == 'capacity':
-                    st.markdown(f"""
-                    **Overloaded Recruiters:**
-                    {', '.join(rec['details']['overloaded_recruiters'])}
-                    
-                    **Why this works:** Adding capacity distributes workload more evenly, 
-                    reducing queue delays and improving success rates across the board.
-                    """)
-                elif rec['type'] == 'process':
-                    st.markdown(f"""
-                    **Current State:**
-                    - High-complexity roles: {rec['details']['high_complexity_count']}
-                    - Current success rate: {rec['details']['current_success']:.1f}%
-                    
-                    **Suggested Actions:**
-                    - Streamline interview process
-                    - Pre-screen candidates more aggressively
-                    - Expand sourcing channels
-                    """)
-                elif rec['type'] == 'quick_win':
-                    st.markdown(f"""
-                    **Roles close to threshold:**
-                    {', '.join(rec['details']['role_ids'])}
-                    
-                    **Suggested Actions:**
-                    - Small deadline extensions (1-2 weeks)
-                    - Priority attention from recruiters
-                    - Consider temporary support
-                    """)
     
     st.markdown("---")
     
-    # Bottleneck Section
-    st.markdown("### 🚨 Identified Bottlenecks")
+    # Bottlenecks
+    st.markdown("### 🚨 Bottlenecks")
     
     if bottlenecks:
         for b in bottlenecks[:5]:
-            sig_badge = '<span style="background: rgba(139, 92, 246, 0.2); color: #a78bfa; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.7rem; margin-left: 0.5rem;">p < 0.05</span>' if b['statistically_significant'] else ''
-            
             st.markdown(f"""
             <div class="bottleneck-card">
-                <h4 style="color: #f43f5e; margin: 0;">⚠️ {b['recruiter']} {sig_badge}</h4>
+                <h4 style="color: #f43f5e; margin: 0;">⚠️ {b['recruiter']}</h4>
                 <p style="color: #94a3b8; margin: 0.5rem 0;">
                     {b['role_count']} roles | {b['high_risk_count']} high risk | {b['failure_ratio']:.1f}x failure rate
-                </p>
-                <p style="color: #cbd5e1; margin-top: 0.5rem;">
-                    <strong>Worst Role:</strong> {b['worst_role'].role_id} ({b['worst_role'].role_name}) — {b['worst_role'].on_time_probability*100:.0f}% success
                 </p>
             </div>
             """, unsafe_allow_html=True)
     else:
-        st.success("No significant bottlenecks identified! 🎉")
-    
-    st.markdown("---")
-    
-    # Summary Action Plan
-    st.markdown("### 📋 Summary Action Plan")
-    
-    action_summary = []
-    for rec in recommendations:
-        action_summary.append({
-            'Priority': rec['priority'],
-            'Type': rec['type'].replace('_', ' ').title(),
-            'Action': rec['title'],
-            'Impact': rec['impact'][:50] + '...' if len(rec['impact']) > 50 else rec['impact']
-        })
-    
-    if action_summary:
-        action_df = pd.DataFrame(action_summary)
-        st.dataframe(action_df, use_container_width=True, hide_index=True)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.success("No significant bottlenecks identified!")
 
-# Footer
+# =============================================================================
+# FOOTER
+# =============================================================================
+
 st.markdown("---")
 st.markdown(f"""
 <div style="text-align: center; color: #64748b; padding: 2rem 0;">
-    <p style="font-size: 0.9rem;">
-        <strong>Mathematical Framework:</strong> Poisson Process + Gamma Distribution | 
-        <strong>{SIMULATION_RUNS:,}</strong> Monte Carlo Simulations
-    </p>
-    <p style="margin-top: 0.5rem; font-size: 0.8rem;">Built with 🔬 by the Hiring Feasibility Engine v3.0</p>
+    <p>Analysis based on <span style="color: #22d3ee;">{SIMULATION_RUNS:,}</span> Monte Carlo simulations</p>
+    <p style="font-size: 0.8rem;">Hiring Feasibility Engine v3.0</p>
 </div>
 """, unsafe_allow_html=True)
