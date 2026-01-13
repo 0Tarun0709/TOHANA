@@ -14,7 +14,6 @@ from src.data_loader import parse_uploaded_data, validate_data
 from src.simulation import run_monte_carlo_simulation
 from src.analysis import analyze_results, identify_bottlenecks, analyze_complexity_impact
 from src.recommendations import generate_recommendations
-from src.llm import get_ai_recommendations, get_available_models
 
 # =============================================================================
 # STREAMLIT APP CONFIGURATION
@@ -544,51 +543,6 @@ with tab2:
 
 with tab3:
     st.markdown('<div class="section-header">💡 Recommendations</div>', unsafe_allow_html=True)
-    
-    # AI Recommendations Section
-    st.markdown("### 🤖 AI-Powered Analysis")
-    
-    with st.expander("Configure AI Recommendations", expanded=False):
-        api_key = st.text_input(
-            "OpenRouter API Key",
-            type="password",
-            help="Get your API key from https://openrouter.ai/keys"
-        )
-        
-        models = get_available_models()
-        selected_model = st.selectbox(
-            "Select Model",
-            options=[m["id"] for m in models],
-            format_func=lambda x: next(m["name"] for m in models if m["id"] == x)
-        )
-    
-    if api_key:
-        if st.button("🚀 Generate AI Recommendations", type="primary"):
-            with st.spinner("Generating AI insights... (this may take 30-60 seconds)"):
-                ai_response, error = get_ai_recommendations(
-                    results=results,
-                    bottlenecks=bottlenecks,
-                    recruiters=recruiters,
-                    api_key=api_key,
-                    model=selected_model
-                )
-            
-            if ai_response:
-                st.markdown("""
-                <div style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.3); border-radius: 12px; padding: 1.5rem; margin: 1rem 0;">
-                    <h4 style="color: #a78bfa; margin: 0 0 1rem 0;">🤖 AI Analysis</h4>
-                </div>
-                """, unsafe_allow_html=True)
-                st.markdown(ai_response)
-            else:
-                st.error(f"Failed to generate AI recommendations: {error}")
-    else:
-        st.info("💡 Enter your OpenRouter API key above to get AI-powered recommendations tailored to your data.")
-    
-    st.markdown("---")
-    
-    # Standard Recommendations
-    st.markdown("### 📋 Standard Recommendations")
     
     col1, col2, col3 = st.columns(3)
     with col1:

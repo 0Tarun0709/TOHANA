@@ -108,34 +108,11 @@ Upload two JSON files:
 
 ### 💡 Recommendations Tab
 
-- **🤖 AI-Powered Analysis** - Get intelligent recommendations using OpenRouter
 - **Prioritized Actions** - High/Medium/Low priority fixes
 - **Reassignment Suggestions** - Move roles to better-suited recruiters
 - **Deadline Extensions** - Which deadlines to push back
 - **Capacity Alerts** - When to add recruiting resources
 - **Bottleneck Analysis** - Who is the constraint?
-
----
-
-## AI Recommendations (Optional)
-
-The dashboard supports AI-powered recommendations using [OpenRouter](https://openrouter.ai/).
-
-### Setup
-
-1. Get an API key from [openrouter.ai/keys](https://openrouter.ai/keys)
-2. Go to the **Recommendations** tab
-3. Enter your API key
-4. Select a model (Claude 3.5 Sonnet recommended)
-5. Click **Generate AI Recommendations**
-
-
-The AI analyzes your data and provides:
-- Executive summary
-- Priority actions with expected impact
-- Risk mitigation strategies
-- Resource optimization suggestions
-- Timeline adjustment recommendations
 
 ---
 
@@ -157,8 +134,7 @@ The AI analyzes your data and provides:
     ├── data_loader.py     # JSON parsing & validation
     ├── simulation.py      # Monte Carlo engine
     ├── analysis.py        # Statistical analysis
-    ├── recommendations.py # Recommendation generation
-    └── llm.py             # OpenRouter AI integration
+    └── recommendations.py # Recommendation generation
 ```
 
 ---
@@ -212,7 +188,6 @@ COMPLEXITY_SHAPE_K = {    # Variance by complexity
 - numpy
 - scipy
 - pandas
-- requests (for AI recommendations)
 
 ---
 
